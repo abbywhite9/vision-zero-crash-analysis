@@ -1,0 +1,1073 @@
+---
+title: "STAT3255 Final Project — Code"
+author: "Abigail L. White"
+format:
+  html:
+    code-fold: true
+    embed-resources: true
+    df-print: paged
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# NYC + Staten Island Crash Data Cleaning 
+
+```{python}
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import statsmodels.api as sm
+
+# Pandas display width
+pd.set_option("display.width", 80)        
+pd.set_option("display.max_colwidth", 80)
+pd.set_option("display.max_columns", 20) 
+
+# Statsmodels summary formatting
+sm.iolib.summary2.Summary.colwidth = 80   
+sm.iolib.summary2.Summary.width = 80
+
+# Numpy print options 
+np.set_printoptions(linewidth=80)
+
+# Plot style for uniform figures
+import matplotlib.pyplot as plt
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+    "legend.fontsize": 9
+})
+
+# Central paths
+DATA = Path("../data")
+FIGS = Path("../figures")
+TABLES = Path("../tables")
+FIGS.mkdir(exist_ok=True)
+TABLES.mkdir(exist_ok=True)
+```
+
+## Setup: valid NYC ZIP codes + valid boroughs
+```{python}
+valid_zip_codes = {
+    10463,10471,10466,10469,10470,10475,10458,10467,10468,
+    10461,10462,10464,10465,10472,10473,10453,10457,10460,
+    10451,10452,10456,10454,10455,10459,10474,11211,11222,
+    11201,11205,11215,11217,11231,11213,11212,11216,11233,
+    11238,11207,11208,11220,11232,11204,11218,11219,11230,
+    11203,11210,11225,11226,11234,11236,11239,11209,11214,
+    11228,11223,11224,11229,11235,11206,11221,11237,10031,
+    10032,10033,10034,10040,10026,10027,10030,10037,10039,
+    10029,10035,10023,10024,10025,10021,10028,10044,10128,
+    10001,10011,10018,10019,10020,10036,10010,10016,10017,
+    10022,10012,10013,10014,10002,10003,10009,10004,10005,
+    10006,10007,10038,10280,11101,11102,11103,11104,11105,
+    11106,11368,11369,11370,11372,11373,11377,11378,11354,
+    11355,11356,11357,11358,11359,11360,11361,11362,11363,
+    11364,11374,11375,11379,11385,11365,11366,11367,11414,
+    11415,11416,11417,11418,11419,11420,11421,11412,11423,
+    11432,11433,11434,11435,11436,11004,11005,11411,11413,
+    11422,11426,11427,11428,11429,11691,11692,11693,11694,
+    11695,11697,10302,10303,10310,10301,10304,10305,10314,
+    10306,10307,10308,10309,10312
+}
+valid_zip_codes_str = {str(z) for z in valid_zip_codes}
+
+valid_boroughs = {"BRONX","BROOKLYN","MANHATTAN","QUEENS","STATEN ISLAND"}
+```
+
+## Function: clean any NYC crash CSV (2013, 2015, SI 2014, SI 2016)
+
+```{python}
+def load_and_clean_crash_data(file_path, bad_dates=None):
+    print(f"\n========== LOADING {file_path} ==========")
+
+    # Load
+    df = pd.read_csv(
+        file_path,
+        dtype={"LATITUDE": "float32",
+               "LONGITUDE": "float32",
+               "ZIP CODE": "string"},
+        low_memory=False
+    )
+
+    # Clean variable names
+    df.columns = df.columns.str.lower().str.replace(" ","_")
+
+    # Remove junk crash dates
+    if bad_dates is not None:
+        df = df[~df["crash_date"].isin(bad_dates)].copy()
+
+    # Missing % summary
+    print("Missing percentage (first 8 cols):")
+    print((df.isnull().mean()*100).head(8))
+
+    # Clean latitude / longitude
+    for col in ["latitude","longitude"]:
+        df.loc[(df[col] == 0) | (df[col].isna()), col] = pd.NA
+        df[col] = df[col].astype("Float32")
+
+    print("Latitude NA:", df["latitude"].isna().sum())
+    print("Longitude NA:", df["longitude"].isna().sum())
+
+    # Clean ZIP code
+    if "zip_code" in df.columns:
+        df["zip_code"] = df["zip_code"].astype("string")
+        df.loc[~df["zip_code"].isin(valid_zip_codes_str), "zip_code"] = pd.NA
+        print("ZIP NA:", df["zip_code"].isna().sum())
+    
+    # Clean borough
+    if "borough" in df.columns:
+        df["borough"] = df["borough"].astype("string").str.upper()
+        df["borough"] = df["borough"].where(
+            df["borough"].isin(valid_boroughs), pd.NA
+        )
+        print("Borough NA:", df["borough"].isna().sum())
+
+        # Co-missing check
+        if "zip_code" in df.columns:
+            both_missing = df[df["zip_code"].isna() & df["borough"].isna()]
+            print("ZIP & Borough both missing:", both_missing.shape[0])
+
+    # Construct crash_datetime + crash_hour
+    df["crash_datetime"] = pd.to_datetime(
+        df["crash_date"] + " " + df["crash_time"],
+        format="%m/%d/%Y %H:%M",
+        errors="coerce"
+    )
+    df["crash_hour"] = df["crash_datetime"].dt.hour
+
+    # Injury & fatality redundancy check
+    injury_cols = [
+        "number_of_pedestrians_injured",
+        "number_of_cyclist_injured",
+        "number_of_motorist_injured"
+    ]
+    kill_cols = [
+        "number_of_pedestrians_killed",
+        "number_of_cyclist_killed",
+        "number_of_motorist_killed"
+    ]
+
+    if all(col in df.columns for col in injury_cols + kill_cols):
+        df["injured_sum"] = df[injury_cols].sum(axis=1)
+        df["killed_sum"] = df[kill_cols].sum(axis=1)
+
+        mismatch_inj = (
+            df["number_of_persons_injured"]
+            != df["injured_sum"]
+        ).sum()
+
+        mismatch_kill = (
+            df["number_of_persons_killed"]
+            != df["killed_sum"]
+        ).sum()
+
+        print("Injury mismatch count:", mismatch_inj)
+        print("Killed mismatch count:", mismatch_kill)
+
+    print("========== FINISHED CLEANING ==========\n")
+    return df
+```
+
+## Load & clean all four crash files
+
+```{python}
+# Use central DATA path
+crash_files = {
+    "nyc2013": DATA/"nyc_crashes2013.csv",
+    "nyc2015": DATA/"nyc_crashes2015.csv",
+    "si2014": DATA/"si_crashes2014.csv",
+    "si2016": DATA/"si_crashes2016.csv"
+}
+
+cleaned = {}
+for name, file in crash_files.items():
+    cleaned[name] = load_and_clean_crash_data(file_path=file)
+```
+
+## Staten Island SIP: SI 2014 + SI 2016
+
+```{python}
+# Add year_month for all datasets
+for df in cleaned.values():
+    df["year_month"] = df["crash_datetime"].dt.to_period("M").astype(str)
+
+# Extract ONLY SI2014 and SI2016 for analysis
+si2014 = cleaned["si2014"].copy()
+si2016 = cleaned["si2016"].copy()
+
+# Combine into one before/after dataset
+si_all = pd.concat([si2014, si2016], ignore_index=True)
+
+# Flag Clove Road crashes
+si_all["on_clove"] = (
+    si_all["on_street_name"].str.contains("CLOVE", case=False, na=False) |
+    si_all["cross_street_name"].str.contains("CLOVE", case=False, na=False)
+).astype(int)
+
+# Add variables used later so we don't redo work
+si_all["year"] = si_all["crash_datetime"].dt.year
+si_all["year_month"] = si_all["crash_datetime"].dt.to_period("M").astype(str)
+si_all["severe"] = (
+    (si_all["number_of_persons_injured"] > 0) |
+    (si_all["number_of_persons_killed"] > 0)
+).astype(int)
+
+print("SI combined shape:", si_all.shape)
+print("Clove Road crash counts:")
+print(si_all["on_clove"].value_counts(), "\n")
+```
+
+## Clean speed_limit.csv
+
+```{python}
+speed = pd.read_csv(DATA/"speed_limit.csv")
+speed.columns = speed.columns.str.lower().str.replace(" ","_")
+
+if "postvz_sl" in speed.columns:
+    speed["postvz_sl"] = (
+        pd.to_numeric(
+            speed["postvz_sl"],
+            errors="coerce"
+        )
+        .astype("Int64")
+    )
+
+if "postvz_sg" in speed.columns:
+    speed["postvz_sg_flag"] = speed["postvz_sg"].map({"YES":1, "NO":0})
+
+print("\nSpeed-limit cleaned:")
+print(speed.head())
+```
+
+## Clean SIP_corridors.csv
+
+```{python}
+sip = pd.read_csv(DATA/"SIP_corridors.csv")
+sip.columns = sip.columns.str.lower().str.replace(" ","_")
+
+if "sip_year" in sip.columns:
+    sip["sip_year"] = (
+        pd.to_numeric(
+            sip["sip_year"],
+            errors="coerce"
+        )
+        .astype("Int64")
+    )
+
+if "end_date" in sip.columns:
+    sip["end_date"] = pd.to_datetime(sip["end_date"], errors="coerce")
+
+print("\nSIP corridors cleaned:")
+print(sip.head())
+```
+
+
+# Exploration for NYC 2013 vs 2015 (Speed Limit Change) and Staten Island 2014 vs 2016 (Clove Road SIP)
+
+```{python}
+from scipy.stats import chi2_contingency
+
+# Mapping libraries
+import geopandas as gpd
+import contextily as ctx
+HAS_MAP_LIBS = True
+```
+
+## NYC-Wide Exploration: 2013 vs 2015 (Speed Limit Change)
+
+```{python}
+# Copy cleaned NYC data
+nyc2013 = cleaned["nyc2013"].copy()
+nyc2015 = cleaned["nyc2015"].copy()
+
+# Add a year variable from crash_datetime
+nyc2013["year"] = nyc2013["crash_datetime"].dt.year
+nyc2015["year"] = nyc2015["crash_datetime"].dt.year
+
+# Define "severe" crash: any injury OR any fatality
+for df in [nyc2013, nyc2015]:
+    df["severe"] = (
+        (df["number_of_persons_injured"] > 0) |
+        (df["number_of_persons_killed"] > 0)
+    ).astype(int)
+
+# Combine NYC years for summary tables
+nyc_all = pd.concat([nyc2013, nyc2015], ignore_index=True)
+```
+
+### Figure 1. NYC total crashes and severe crashes by year
+
+```{python}
+crash_counts_year = (
+    nyc_all.groupby("year")
+    .agg(
+        total_crashes=("collision_id", "count"),
+        severe_crashes=("severe", "sum")
+    )
+    .reset_index()
+)
+
+print("NYC crash counts by year (2013 vs 2015):")
+print(crash_counts_year, "\n")
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+
+ax[0].bar(crash_counts_year["year"], crash_counts_year["total_crashes"])
+ax[0].set_title("NYC Total Crashes by Year")
+ax[0].set_xlabel("Year")
+ax[0].set_ylabel("Number of Crashes")
+
+ax[1].bar(crash_counts_year["year"], crash_counts_year["severe_crashes"])
+ax[1].set_title("NYC Severe Crashes by Year")
+ax[1].set_xlabel("Year")
+ax[1].set_ylabel("Number of Severe Crashes")
+
+plt.tight_layout()
+plt.show()
+```
+
+NYC saw slightly more total crashes but fewer severe crashes from 2013 to 2015,
+suggesting improved safety severity-wise.
+
+### Figure 2. NYC Monthly Total Crashes (2013 vs 2015)
+
+```{python}
+# Build monthly dataset if not already built
+for df in [nyc2013, nyc2015]:
+    df["year_month"] = df["crash_datetime"].dt.to_period("M").astype(str)
+
+monthly_nyc = (
+    pd.concat([nyc2013, nyc2015], ignore_index=True)
+    .groupby("year_month")
+    .agg(
+        total_crashes=("collision_id", "count"),
+        severe_crashes=("severe", "sum")
+    )
+    .reset_index()
+)
+
+monthly_nyc["year_month"] = pd.to_datetime(monthly_nyc["year_month"])
+
+# Split years so they don’t connect
+nyc2013_monthly = monthly_nyc[monthly_nyc["year_month"].dt.year == 2013]
+nyc2015_monthly = monthly_nyc[monthly_nyc["year_month"].dt.year == 2015]
+
+plt.figure(figsize=(10, 4))
+
+plt.plot(
+    nyc2013_monthly["year_month"],
+    nyc2013_monthly["total_crashes"],
+    marker="o",
+    linewidth=2,
+    color="steelblue",
+    label="2013"
+)
+
+plt.plot(
+    nyc2015_monthly["year_month"],
+    nyc2015_monthly["total_crashes"],
+    marker="o",
+    linewidth=2,
+    color="firebrick",
+    label="2015"
+)
+
+plt.axvline(
+    pd.to_datetime("2014-11-01"),
+    color="black",
+    linestyle="--",
+    label="Speed Limit Change"
+)
+
+plt.title("NYC Monthly Total Crashes (Before & After Policy)")
+plt.xlabel("Month")
+plt.ylabel("Total Crashes")
+plt.xticks(rotation=45)
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+NYC’s monthly totals fluctuate seasonally, but there’s no clear drop in overall
+crashes right after the speed-limit change.
+
+### Figure 3. Crash time-of-day distribution before vs after
+
+```{python}
+plt.figure(figsize=(10, 4))
+
+plt.hist(nyc2013["crash_hour"], bins=24, alpha=0.5, label="2013",
+         color="steelblue", edgecolor="black", linewidth=1.2)
+
+plt.hist(nyc2015["crash_hour"], bins=24, alpha=0.5, label="2015",
+         color="pink", edgecolor="black", linewidth=1.2)
+
+plt.title("NYC Crashes by Hour of Day (2013 vs 2015)")
+plt.xlabel("Hour of Day")
+plt.ylabel("Number of Crashes")
+plt.xticks(range(0, 24))
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+Crashes follow the same daily pattern in 2013 and 2015, with similar morning
+increases, afternoon peaks, and evening declines.
+
+### Figure 4. Crashes by borough (overall and severe) before vs after
+
+```{python}
+nyc_all_boro = pd.concat([nyc2013, nyc2015], ignore_index=True)
+
+borough_year_counts = (
+    nyc_all_boro.groupby(["borough", "year"])
+    .agg(
+        total_crashes=("collision_id", "count"),
+        severe_crashes=("severe", "sum")
+    )
+    .reset_index()
+)
+
+print("NYC crashes by borough and year:")
+print(borough_year_counts, "\n")
+
+pivot_total = borough_year_counts.pivot(
+    index="borough",
+    columns="year",
+    values="total_crashes"
+)
+pivot_total.plot(kind="bar", figsize=(8, 4))
+plt.title("NYC Total Crashes by Borough and Year")
+plt.xlabel("Borough")
+plt.ylabel("Number of Crashes")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+```
+
+Borough-level totals look very similar across years, with only small increases
+or decreases, suggesting no major shift in overall crash volume between 2013
+and 2015.
+
+```{python}
+# Create NYC geodataframes for 2013 and 2015
+nyc2013_geo = nyc2013.dropna(subset=["latitude","longitude"]).copy()
+nyc2015_geo = nyc2015.dropna(subset=["latitude","longitude"]).copy()
+
+gdf_2013 = gpd.GeoDataFrame(
+nyc2013_geo,
+geometry=gpd.points_from_xy(nyc2013_geo["longitude"], nyc2013_geo["latitude"]),
+crs="EPSG:4326"
+).to_crs(epsg=3857)
+
+gdf_2015 = gpd.GeoDataFrame(
+nyc2015_geo,
+geometry=gpd.points_from_xy(nyc2015_geo["longitude"], nyc2015_geo["latitude"]),
+crs="EPSG:4326"
+).to_crs(epsg=3857)
+```
+
+### Figure 5. NYC Map: 2013 vs 2015
+
+```{python}
+# Matched-zoom for clean comparison
+xmin, ymin, xmax, ymax = gdf_2013.total_bounds
+
+fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+
+gdf_2013.plot(ax=ax[0], markersize=2, alpha=0.45, color="blue")
+ctx.add_basemap(ax[0], crs=gdf_2013.crs)
+ax[0].set_xlim(xmin, xmax); ax[0].set_ylim(ymin, ymax)
+ax[0].set_title("NYC Crashes Before Policy (2013)")
+ax[0].set_axis_off()
+
+gdf_2015.plot(ax=ax[1], markersize=2, alpha=0.45, color="red")
+ctx.add_basemap(ax[1], crs=gdf_2015.crs)
+ax[1].set_xlim(xmin, xmax); ax[1].set_ylim(ymin, ymax)
+ax[1].set_title("NYC Crashes After Policy (2015)")
+ax[1].set_axis_off()
+
+plt.tight_layout()
+plt.show()
+```
+
+Crash locations look similarly widespread across the city in both years, with
+no obvious visual shift in where crashes occur after the policy change.
+
+## Figure 6. Animated Monthly NYC Crashes (2013 and 2015)
+
+```{python}
+#| cache: false
+from matplotlib.animation import FuncAnimation
+
+# Prepare datasets
+nyc13 = cleaned["nyc2013"].dropna(subset=["latitude","longitude"]).copy()
+nyc15 = cleaned["nyc2015"].dropna(subset=["latitude","longitude"]).copy()
+
+nyc13["year_month"] = nyc13["crash_datetime"].dt.to_period("M").astype(str)
+nyc15["year_month"] = nyc15["crash_datetime"].dt.to_period("M").astype(str)
+
+g13 = gpd.GeoDataFrame(
+    nyc13,
+    geometry=gpd.points_from_xy(nyc13["longitude"], nyc13["latitude"]),
+    crs="EPSG:4326"
+).to_crs(3857)
+
+g15 = gpd.GeoDataFrame(
+    nyc15,
+    geometry=gpd.points_from_xy(nyc15["longitude"], nyc15["latitude"]),
+    crs="EPSG:4326"
+).to_crs(3857)
+
+months13 = sorted(g13["year_month"].unique())
+months15 = sorted(g15["year_month"].unique())
+
+# Make aligned frame list
+max_frames = max(len(months13), len(months15))
+
+# Extend shorter list with placeholder values
+months13_ext = months13 + [""] * (max_frames - len(months13))
+months15_ext = months15 + [""] * (max_frames - len(months15))
+
+xmin, ymin, xmax, ymax = g13.total_bounds
+
+fig, ax = plt.subplots(1, 2, figsize=(14, 6))
+
+def update(i):
+    ax[0].clear()
+    ax[1].clear()
+
+    month13 = months13_ext[i]
+    month15 = months15_ext[i]
+
+    # 2013 panel
+    if month13 != "":
+        d13 = g13[g13["year_month"] == month13]
+        d13.plot(ax=ax[0], markersize=3, alpha=0.4, color="steelblue")
+        ctx.add_basemap(ax[0], crs=g13.crs)
+        ax[0].set_title(f"NYC 2013 — {month13}")
+    else:
+        ax[0].set_title("NYC 2013 — (no data)")
+
+    ax[0].set_xlim(xmin, xmax); ax[0].set_ylim(ymin, ymax)
+    ax[0].set_axis_off()
+
+    # 2015 panel
+    if month15 != "":
+        d15 = g15[g15["year_month"] == month15]
+        d15.plot(ax=ax[1], markersize=3, alpha=0.4, color="firebrick")
+        ctx.add_basemap(ax[1], crs=g15.crs)
+        ax[1].set_title(f"NYC 2015 — {month15}")
+    else:
+        ax[1].set_title("NYC 2015 — (no data)")
+
+    ax[1].set_xlim(xmin, xmax); ax[1].set_ylim(ymin, ymax)
+    ax[1].set_axis_off()
+
+ani = FuncAnimation(fig, update, frames=max_frames, interval=800)
+ani.save(FIGS/"nyc_13_vs_15.gif")
+plt.close(fig)
+
+print("Saved:", FIGS/"nyc_13_vs_15.gif")
+```
+![](../figures/nyc_13_vs_15.gif){width=80%}
+
+Spatial patterns stay consistent, crashes cluster on the same major roads, with
+changes in volume rather than location.
+
+## Staten Island / Clove Road Exploration: 2014 vs 2016 (Street Improvement Project)
+
+```{python}
+# si_all already contains year, year_month, severe, and on_clove
+print(
+    "Staten Island combined dataset shape (SI 2014 + SI 2016):",
+    si_all.shape
+)
+print("Clove Road crash counts (0 = not on Clove, 1 = on Clove):")
+print(si_all["on_clove"].value_counts(), "\n")
+```
+
+### Figure 7. Staten Island total and severe crashes by year
+
+```{python}
+si_counts_year = (
+    si_all.groupby("year")
+    .agg(
+        total_crashes=("collision_id", "count"),
+        severe_crashes=("severe", "sum")
+    )
+    .reset_index()
+)
+
+print("Staten Island crash counts by year:")
+print(si_counts_year, "\n")
+
+fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+
+ax[0].bar(si_counts_year["year"], si_counts_year["total_crashes"])
+ax[0].set_title("Staten Island Total Crashes by Year")
+ax[0].set_xlabel("Year")
+ax[0].set_ylabel("Number of Crashes")
+
+ax[1].bar(si_counts_year["year"], si_counts_year["severe_crashes"])
+ax[1].set_title("Staten Island Severe Crashes by Year")
+ax[1].set_xlabel("Year")
+ax[1].set_ylabel("Number of Severe Crashes")
+
+plt.tight_layout()
+plt.show()
+```
+
+Staten Island’s total crashes stay about the same, while severe crashes show
+a small decline from 2014 to 2016.
+
+### Figure 8. Monthly crashes on Clove Road vs elsewhere in Staten Island
+
+```{python}
+si_all_plot = si_all.copy()
+
+# Aggregate monthly crash counts for Clove vs non-Clove
+monthly_si_clove = (
+    si_all_plot.groupby(["year_month", "on_clove"])
+    .agg(
+        total_crashes=("collision_id", "count"),
+        severe_crashes=("severe", "sum")
+    )
+    .reset_index()
+)
+
+# Convert to datetime
+monthly_si_clove["year_month"] = pd.to_datetime(monthly_si_clove["year_month"])
+
+# Split into Clove and non-Clove subsets
+clove = monthly_si_clove[monthly_si_clove["on_clove"] == 1]
+other = monthly_si_clove[monthly_si_clove["on_clove"] == 0]
+
+# Split years to avoid line-connecting between 2014 and 2016
+clove_2014 = clove[clove["year_month"].dt.year == 2014]
+clove_2016 = clove[clove["year_month"].dt.year == 2016]
+
+other_2014 = other[other["year_month"].dt.year == 2014]
+other_2016 = other[other["year_month"].dt.year == 2016]
+
+# Plot
+fig, ax = plt.subplots(figsize=(10, 4))
+
+# Clove Road
+ax.plot(
+    clove_2014["year_month"], clove_2014["total_crashes"],
+    marker="o", linewidth=2, color="firebrick",
+    label="Clove Road (2014)"
+)
+ax.plot(
+    clove_2016["year_month"], clove_2016["total_crashes"],
+    marker="o", linewidth=2, color="salmon",
+    label="Clove Road (2016)"
+)
+
+# Other SI roads
+ax.plot(
+    other_2014["year_month"], other_2014["total_crashes"],
+    marker="o", linewidth=2, color="steelblue",
+    label="Other SI Roads (2014)"
+)
+ax.plot(
+    other_2016["year_month"], other_2016["total_crashes"],
+    marker="o", linewidth=2, color="skyblue",
+    label="Other SI Roads (2016)"
+)
+
+# Labels + formatting
+ax.set_title("Monthly Crashes: Clove Road vs Other Staten Island Roads")
+ax.set_xlabel("Month")
+ax.set_ylabel("Number of Crashes")
+plt.xticks(rotation=45)
+plt.legend()
+plt.tight_layout()
+
+# Save as PNG
+fig.savefig("../figures/si_clove_monthly.png", dpi=300, bbox_inches="tight")
+
+plt.close()
+```
+![](../figures/si_clove_monthly.png){width="80%"}
+
+Clove Road drops slightly while the rest of SI stays steady, suggesting a small
+localized improvement after the redesign.
+
+### Figure 9. Staten Island crashes with Clove Road highlighted (point map)
+
+```{python}
+import os
+os.makedirs("../figures", exist_ok=True)
+
+#   SIP Monthly Plot
+sip_date = pd.to_datetime("2015-01-01")
+
+si_2014 = monthly_si_clove[monthly_si_clove["year_month"].dt.year == 2014]
+si_2016 = monthly_si_clove[monthly_si_clove["year_month"].dt.year == 2016]
+
+plt.figure(figsize=(10, 4))
+plt.plot(si_2014["year_month"], si_2014["total_crashes"],
+         marker="o", linewidth=2, color="steelblue", label="Staten Island (2014)")
+plt.plot(si_2016["year_month"], si_2016["total_crashes"],
+         marker="o", linewidth=2, color="firebrick", label="Staten Island (2016)")
+plt.axvline(sip_date, color="purple", linestyle="--", linewidth=2,
+            label="SIP Implementation (Jan 2015)")
+
+plt.title("Staten Island Monthly Crashes (SIP Highlighted)")
+plt.xlabel("Month")
+plt.ylabel("Number of Crashes")
+plt.xticks(rotation=45)
+plt.legend()
+plt.tight_layout()
+
+plt.savefig("../figures/si_sip_monthly.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+# GEO Map
+si_geo = si_all.dropna(subset=["latitude", "longitude"]).copy()
+
+gdf_si = gpd.GeoDataFrame(
+    si_geo,
+    geometry=gpd.points_from_xy(si_geo["longitude"], si_geo["latitude"]),
+    crs="EPSG:4326"
+).to_crs(epsg=3857)
+
+gdf_clove = gdf_si[gdf_si["on_clove"] == 1]
+gdf_other = gdf_si[gdf_si["on_clove"] == 0]
+
+fig, ax = plt.subplots(figsize=(8, 8))
+
+gdf_other.plot(ax=ax, markersize=2, alpha=0.25, color="gray", label="Other SI Crashes")
+gdf_clove.plot(ax=ax, markersize=12, color="red", label="Clove Road Crashes")
+
+# Try basemap
+added_basemap = False
+try:
+    ctx.add_basemap(ax, crs=gdf_si.crs, source=ctx.providers.CartoDB.Positron)
+    added_basemap = True
+except Exception as e:
+    print("Basemap unavailable — saving map WITHOUT basemap.", e)
+
+ax.set_axis_off()
+ax.set_title("Staten Island Crashes with Clove Road Highlighted")
+plt.legend()
+plt.tight_layout()
+
+# Save PNG 
+output_path = "../figures/si_clove_map.png"
+plt.savefig(output_path, dpi=300, bbox_inches="tight")
+plt.close()
+
+print(f"Map saved to: {output_path} (basemap added: {added_basemap})")
+```
+![](../figures/si_clove_map.png){width="80%"}
+
+Crashes cluster on Staten Island’s major arterials, with Clove Road showing a
+clear hotspot that supports focusing on it.
+
+```{python}
+# Create Staten Island geodataframes for 2014 and 2016
+si2014_geo = cleaned["si2014"].dropna(subset=["latitude","longitude"]).copy()
+si2016_geo = cleaned["si2016"].dropna(subset=["latitude","longitude"]).copy()
+
+gdf_si_2014 = gpd.GeoDataFrame(
+    si2014_geo,
+    geometry=gpd.points_from_xy(si2014_geo["longitude"], si2014_geo["latitude"]),
+    crs="EPSG:4326"
+).to_crs(epsg=3857)
+
+gdf_si_2016 = gpd.GeoDataFrame(
+    si2016_geo,
+    geometry=gpd.points_from_xy(si2016_geo["longitude"], si2016_geo["latitude"]),
+    crs="EPSG:4326"
+).to_crs(epsg=3857)
+```
+
+### Figure 10. Staten Island Map: 2014 vs 2016
+
+```{python}
+xmin_si, ymin_si, xmax_si, ymax_si = gdf_si_2014.total_bounds
+
+fig, ax = plt.subplots(1, 2, figsize=(15, 6))
+
+gdf_si_2014.plot(ax=ax[0], markersize=5, alpha=0.45, color="blue")
+ctx.add_basemap(ax[0], crs=gdf_si_2014.crs)
+ax[0].set_xlim(xmin_si, xmax_si); ax[0].set_ylim(ymin_si, ymax_si)
+ax[0].set_title("Staten Island Crashes Before SIP (2014)")
+ax[0].set_axis_off()
+
+gdf_si_2016.plot(ax=ax[1], markersize=5, alpha=0.45, color="red")
+ctx.add_basemap(ax[1], crs=gdf_si_2016.crs)
+ax[1].set_xlim(xmin_si, xmax_si); ax[1].set_ylim(ymin_si, ymax_si)
+ax[1].set_title("Staten Island Crashes After SIP (2016)")
+ax[1].set_axis_off()
+
+plt.tight_layout()
+plt.show()
+```
+
+Overall crash patterns stay similar before and after SIP, with changes in
+volume rather than where crashes occur.
+
+# Policy Change Modeling: NYC Speed Limit and Staten Island Clove SIP
+
+```{python}
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+```
+
+## Rebuild monthly NYC + SI data 
+
+```{python}
+# NYC (2013 + 2015)
+if "monthly_nyc" not in globals():
+    nyc2013 = cleaned["nyc2013"].copy()
+    nyc2015 = cleaned["nyc2015"].copy()
+
+    for df in [nyc2013, nyc2015]:
+        df["severe"] = ((df["number_of_persons_injured"] > 0) |
+                        (df["number_of_persons_killed"] > 0)).astype(int)
+        df["year_month"] = df["crash_datetime"].dt.to_period("M").astype(str)
+
+    monthly_nyc = (
+        pd.concat([nyc2013, nyc2015], ignore_index=True)
+        .groupby("year_month")
+        .agg(
+            total_crashes=("collision_id", "count"),
+            severe_crashes=("severe", "sum")
+        )
+        .reset_index()
+    )
+
+    monthly_nyc["year_month"] = pd.to_datetime(monthly_nyc["year_month"])
+    monthly_nyc = monthly_nyc.sort_values("year_month")
+
+# Staten Island (2014 + 2016)
+if "monthly_si_clove" not in globals():
+    si_all_model = si_all.copy()
+
+    monthly_si_clove = (
+        si_all_model.groupby(["year_month", "on_clove"])
+        .agg(
+            total_crashes=("collision_id", "count"),
+            severe_crashes=("severe", "sum")
+        )
+        .reset_index()
+    )
+
+    monthly_si_clove["year_month"] = pd.to_datetime(
+        monthly_si_clove["year_month"]
+    )
+    monthly_si_clove = monthly_si_clove.sort_values("year_month")
+```
+
+## NYC Speed Limit Model (2013 vs 2015)
+
+### NYC Total Crash Model — Key Takeaways
+
+```{python}
+nyc_model = monthly_nyc.copy()
+nyc_model["year"] = nyc_model["year_month"].dt.year
+nyc_model["month"] = nyc_model["year_month"].dt.month
+
+# NYC speed-limit change implemented Nov 2014
+nyc_model["post"] = (
+    nyc_model["year_month"]
+    >= pd.to_datetime("2014-11-01")
+).astype(int)
+
+print("NYC modeling dataset head:\n", nyc_model.head(), "\n")
+
+nyc_mean = nyc_model["total_crashes"].mean()
+nyc_var  = nyc_model["total_crashes"].var()
+print(f"NYC mean={nyc_mean:.2f}, variance={nyc_var:.2f}")
+
+poisson_nyc = smf.glm(
+    formula="total_crashes ~ post + C(month)",
+    data=nyc_model,
+    family=sm.families.Poisson()
+).fit()
+
+print("\nNYC Poisson Model Summary:")
+print(poisson_nyc.summary())
+
+nyc_irrs = np.exp(poisson_nyc.params)
+print("NYC Poisson IRRs:\n", nyc_irrs.to_string(), "\n")
+
+nyc_overdisp = poisson_nyc.deviance / poisson_nyc.df_resid
+print(f"\nNYC overdispersion ratio: {nyc_overdisp:.2f}")
+
+# Estimate NB alpha by method-of-moments instead of using overdispersion
+# alpha_hat = (Var(Y) - E(Y)) / E(Y)^2  (truncated at >0)
+alpha_hat_nyc = max((nyc_var - nyc_mean) / (nyc_mean**2), 1e-8)
+print(f"NYC alpha_hat (NB dispersion): {alpha_hat_nyc:.4f}")
+
+nb_nyc = sm.GLM.from_formula(
+    formula="total_crashes ~ post + C(month)",
+    data=nyc_model,
+    family=sm.families.NegativeBinomial(alpha=alpha_hat_nyc)
+).fit()
+
+print("\nNYC Negative Binomial Summary:")
+print(nb_nyc.summary())
+
+nyc_irrs_nb = np.exp(nb_nyc.params)
+print("\nNYC NB IRRs:")
+print(nyc_irrs_nb)
+
+print(f"\nNYC AIC: Poisson={poisson_nyc.aic:.1f} | NB={nb_nyc.aic:.1f}")
+```
+
+## Staten Island Clove Road SIP Model (2014 vs 2016)
+
+### Staten Island DID Model — Key Takeaways
+
+```{python}
+si_model = monthly_si_clove.copy()
+si_model["year"] = si_model["year_month"].dt.year
+si_model["month"] = si_model["year_month"].dt.month
+si_model["post"] = (si_model["year"] >= 2015).astype(int)
+
+print("SI modeling dataset head:\n", si_model.head(), "\n")
+
+si_mean = si_model["total_crashes"].mean()
+si_var  = si_model["total_crashes"].var()
+print(f"SI mean={si_mean:.2f}, variance={si_var:.2f}")
+
+poisson_si = smf.glm(
+    formula="total_crashes ~ post * on_clove + C(month)",
+    data=si_model,
+    family=sm.families.Poisson()
+).fit()
+
+print("\nStaten Island Poisson Model Summary:")
+print(poisson_si.summary())
+
+si_irrs = np.exp(poisson_si.params)
+print("SI Poisson IRRs:\n", si_irrs.to_string(), "\n")
+
+si_overdisp = poisson_si.deviance / poisson_si.df_resid
+print(f"\nSI Poisson overdispersion ratio: {si_overdisp:.2f}")
+
+# Estimate NB alpha by method-of-moments
+alpha_hat_si = max((si_var - si_mean) / (si_mean**2), 1e-8)
+print(f"SI alpha_hat (NB dispersion): {alpha_hat_si:.4f}")
+
+nb_si = sm.GLM.from_formula(
+    formula="total_crashes ~ post * on_clove + C(month)",
+    data=si_model,
+    family=sm.families.NegativeBinomial(alpha=alpha_hat_si)
+).fit()
+
+print("\nStaten Island NB Summary:")
+print(nb_si.summary())
+
+si_irrs_nb = np.exp(nb_si.params)
+print("\nSI NB IRRs:")
+print(si_irrs_nb)
+
+print(f"\nSI AIC: Poisson={poisson_si.aic:.1f} | NB={nb_si.aic:.1f}")
+```
+
+## Severe Crashes Instead of Total Crashes
+
+```{python}
+nyc_model_sev = nyc_model.copy()
+nyc_model_sev["y"] = nyc_model_sev["severe_crashes"]
+
+poisson_nyc_sev = smf.glm(
+    formula="y ~ post + C(month)",
+    data=nyc_model_sev,
+    family=sm.families.Poisson()
+).fit()
+
+print("\nNYC Severe-Crash Poisson Summary:")
+print(poisson_nyc_sev.summary(), "\n")
+
+si_model_sev = si_model.copy()
+si_model_sev["y"] = si_model_sev["severe_crashes"]
+
+poisson_si_sev = smf.glm(
+    formula="y ~ post * on_clove + C(month)",
+    data=si_model_sev,
+    family=sm.families.Poisson()
+).fit()
+
+print("\nStaten Island Severe-Crash Poisson Summary:")
+print(poisson_si_sev.summary(), "\n")
+```
+
+## Summary Table of Policy Effects (IRRs)
+
+```{python}
+def safe_exp(param_series, key):
+    try:
+        return float(np.exp(param_series[key]))
+    except Exception:
+        return np.nan
+
+pd.set_option('display.max_colwidth', None)
+
+summary_table = pd.DataFrame({
+    "Model": [
+        "NYC Total Crashes (Poisson)",
+        "NYC Severe Crashes (Poisson)",
+        "Staten Island Total Crashes DID Effect (Poisson)",
+        "Staten Island Severe Crashes DID Effect (Poisson)"
+    ],
+    "IRR (Policy Effect)": [
+        safe_exp(poisson_nyc.params, "post"),
+        safe_exp(poisson_nyc_sev.params, "post"),
+        safe_exp(poisson_si.params, "post:on_clove"),
+        safe_exp(poisson_si_sev.params, "post:on_clove")
+    ],
+    "Interpretation": [
+        "Percent change in total NYC crashes after Nov 2014 speed "
+        "limit change.",
+
+        "Percent change in severe NYC crashes after Nov 2014 speed "
+        "limit change.",
+
+        "Difference-in-differences effect on Clove Rd crashes after "
+        "SIP vs rest of SI.",
+
+        "DID effect on severe crashes on Clove Rd after SIP vs rest "
+        "of SI."
+    ]   
+})
+
+summary_table
+
+# also show as markdown to avoid any HTML truncation
+summary_table.to_markdown(index=False)
+```
+
+### Overall interpretation
+
+Based on the descriptive plots and regression models, NYC’s November 2014
+speed-limit reduction is associated with modest decreases in severe crashes,
+while total crash counts show little to no clear reduction. In the monthly
+models, the post-policy IRR for severe crashes is consistently below 1.0 after
+adjusting for seasonality, indicating a relative decline in high-injury
+collisions. The Negative Binomial models produce similar IRRs, suggesting the 
+direction of the effect is robust even after accounting for overdispersion.
+
+For Staten Island, the difference-in-differences model compares changes on
+Clove Road to changes occurring across the rest of the borough. An IRR
+(post × on_clove) below 1.0 indicates that Clove Road’s crash trends improved 
+slightly more than the background borough trend, consistent with a localized 
+benefit from the SIP corridor redesign.
+
+These estimates are based on observational data and cannot establish causality. 
+However, the alignment between descriptive plots, spatial patterns, and 
+model-based IRRs provides coherent evidence that the Vision Zero interventions, 
+especially the Clove Road SIP project, are associated with small but meaningful 
+improvements in crash severity.

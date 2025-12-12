@@ -1,0 +1,518 @@
+---
+title: "Traffic Crashes & Street Design: Evaluating Vision Zero"
+author: "Abigail White"
+format:
+  revealjs:
+    theme: serif
+    slide-number: true
+    transition: fade
+    width: 1280
+    height: 800
+    embed-resources: true
+    center: false
+    scrollable: true
+toc: false
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+```{python}
+#| include: false
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from pathlib import Path
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+DATA = Path("../data")
+FIGS = Path("../figures")
+
+# Load cleaned crash files (already standardized in code.qmd)
+nyc2013 = pd.read_csv(DATA/"nyc_crashes2013.csv", low_memory=False)
+nyc2015 = pd.read_csv(DATA/"nyc_crashes2015.csv", low_memory=False)
+si2014  = pd.read_csv(DATA/"si_crashes2014.csv", low_memory=False)
+si2016  = pd.read_csv(DATA/"si_crashes2016.csv", low_memory=False)
+
+# Standardize column names to lowercase with underscores
+def std_cols(df):
+    df.columns = df.columns.str.lower().str.strip().str.replace(" ", "_")
+    return df
+
+nyc2013 = std_cols(nyc2013)
+nyc2015 = std_cols(nyc2015)
+si2014 = std_cols(si2014)
+si2016 = std_cols(si2016)
+
+# Datetime + severity
+def add_fields(df):
+    df["crash_datetime"] = pd.to_datetime(
+        df["crash_date"].astype(str) + " " + df["crash_time"].astype(str),
+        errors="coerce"
+    )
+
+    df["severe"] = (
+        (df["number_of_persons_injured"] > 0) |
+        (df["number_of_persons_killed"] > 0)
+    ).astype(int)
+
+    df["year"] = df["crash_datetime"].dt.year
+    df["year_month"] = df["crash_datetime"].dt.to_period("M").astype(str)
+    df["crash_hour"] = df["crash_datetime"].dt.hour
+
+    return df
+
+nyc2013, nyc2015, si2014, si2016 = map(add_fields,
+    [nyc2013, nyc2015, si2014, si2016]
+)
+
+# NYC aggregates
+nyc_all = pd.concat([nyc2013, nyc2015], ignore_index=True)
+crash_counts_year = nyc_all.groupby("year").agg(
+    total_crashes=("collision_id", "count"),
+    severe_crashes=("severe", "sum")
+).reset_index()
+
+monthly_nyc = nyc_all.groupby("year_month").agg(
+    total_crashes=("collision_id", "count"),
+    severe_crashes=("severe", "sum")
+).reset_index()
+monthly_nyc["year_month"] = pd.to_datetime(monthly_nyc["year_month"])
+monthly_nyc = monthly_nyc.sort_values("year_month")
+
+# Borough counts
+borough_year_counts = nyc_all.groupby(["borough", "year"]).agg(
+    total_crashes=("collision_id", "count"),
+    severe_crashes=("severe", "sum")
+).reset_index()
+
+# SI combined + Clove flag
+si_all = pd.concat([si2014, si2016], ignore_index=True)
+si_all["on_clove"] = (
+    si_all["on_street_name"].str.contains("CLOVE", case=False, na=False) |
+    si_all["cross_street_name"].str.contains("CLOVE", case=False, na=False)
+).astype(int)
+
+si_counts_year = si_all.groupby("year").agg(
+    total_crashes=("collision_id", "count"),
+    severe_crashes=("severe", "sum")
+).reset_index()
+
+monthly_si_clove = si_all.groupby(["year_month", "on_clove"]).agg(
+    total_crashes=("collision_id", "count"),
+    severe_crashes=("severe", "sum")
+).reset_index()
+monthly_si_clove["year_month"] = pd.to_datetime(monthly_si_clove["year_month"])
+monthly_si_clove = monthly_si_clove.sort_values("year_month")
+
+# Geo for SI map
+si_geo = si_all.dropna(subset=["latitude", "longitude"]).copy()
+gdf_si = gpd.GeoDataFrame(
+    si_geo,
+    geometry=gpd.points_from_xy(si_geo["longitude"], si_geo["latitude"]),
+    crs="EPSG:4326"
+).to_crs(epsg=3857)
+gdf_clove = gdf_si[gdf_si["on_clove"] == 1]
+gdf_other = gdf_si[gdf_si["on_clove"] == 0]
+
+# Models
+nyc_model = monthly_nyc.copy()
+nyc_model["month"] = nyc_model["year_month"].dt.month
+nyc_model["post"] = (
+    nyc_model["year_month"]
+    >= pd.to_datetime("2014-11-01")
+).astype(int)
+
+poisson_nyc = smf.glm("total_crashes ~ post + C(month)", data=nyc_model,
+                      family=sm.families.Poisson()).fit()
+nyc_overdisp = poisson_nyc.deviance / poisson_nyc.df_resid
+alpha_hat_nyc = max(
+    (
+        nyc_model["total_crashes"].var()
+        - nyc_model["total_crashes"].mean()
+    )
+    / (nyc_model["total_crashes"].mean() ** 2),
+    1e-8
+)
+
+nb_nyc = sm.GLM.from_formula(
+    "total_crashes ~ post + C(month)",
+    data=nyc_model,
+    family=sm.families.NegativeBinomial(alpha=alpha_hat_nyc)
+).fit()
+
+poisson_nyc_sev = smf.glm("severe_crashes ~ post + C(month)", data=nyc_model,
+                          family=sm.families.Poisson()).fit()
+
+si_model = monthly_si_clove.copy()
+si_model["year"] = si_model["year_month"].dt.year
+si_model["month"] = si_model["year_month"].dt.month
+si_model["post"] = (si_model["year"] >= 2015).astype(int)
+
+poisson_si = smf.glm(
+    "total_crashes ~ post * on_clove + C(month)",
+    data=si_model,
+    family=sm.families.Poisson()
+).fit()
+
+poisson_si_sev = smf.glm(
+    "severe_crashes ~ post * on_clove + C(month)",
+    data=si_model,
+    family=sm.families.Poisson()
+).fit()
+
+def irr(series, key):
+    return float(np.exp(series[key]))
+```
+
+## Why This Project?
+
+Vision Zero is New York City’s commitment to eliminating traffic deaths through 
+safer street design and policy. 
+I wanted to evaluate whether two major interventions actually produced 
+measurable improvements:
+
+- **Citywide policy:** 2014 speed‑limit reduction (30→25 MPH)  
+- **Corridor redesign:** Clove Road SIP on Staten Island (2015)
+
+Growing up on Staten Island, I’ve seen how much residents rely on a few major 
+roads and how unsafe they can feel. Clove Road has long stood out for speeding 
+and visibility issues, so evaluating this project is a way to see whether 
+these changes actually improved safety in a community I know well.
+
+**Why it matters:** even small reductions in travel speed dramatically decrease 
+the risk of severe injury or death, and Staten Island’s unique mix of suburban 
+street layouts and car dependency makes targeted corridor improvements 
+especially important.
+
+---
+
+## Research Questions
+
+- **NYC-wide:** Did the speed-limit change correspond to fewer crashes or 
+severe crashes?  
+- **Staten Island:** Did crashes on Clove Road fall more than the rest of 
+Staten Island after SIP?  
+- Do these changes hold consistently across different months and locations?
+
+These questions let us isolate policy effects at both the citywide and corridor 
+level.
+
+---
+
+## Policy Timeline
+
+- **March 2014:** NYC adopts Vision Zero  
+- **Nov 2014:** Default speed limit lowered 30 → 25 MPH  
+- **2015:** Clove Road Safety Improvement Project (SIP) begins
+- **2016:** Post‑SIP evaluation window
+
+This timeline defines our “before vs after” windows.
+
+---
+
+## Data + Variables
+
+**NYC Open Data Motor Vehicle Collisions**
+
+- Crash date/time → monthly series
+- Injuries or fatalities → severe crash indicator
+- Staten Island subset + street names → Clove Road flag
+
+**Key constructed variables**  
+- `severe = 1` if any injury/fatality  
+- `post` = after policy window  
+- `on_clove` = crash on/near Clove Road
+
+---
+
+## NYC: Total vs Severe Crashes by Year
+
+```{python}
+#| fig-cap: "Comparison of total crashes and severe crashes in NYC before (2013) and after (2015) the speed-limit reduction."
+#| fig-align: center
+#| out-width: 85%
+fig, ax = plt.subplots(1, 2, figsize=(9, 3.5))
+ax[0].bar(crash_counts_year["year"], crash_counts_year["total_crashes"])
+ax[0].set_title("Total Crashes")
+ax[0].set_xlabel("Year"); ax[0].set_ylabel("Crashes")
+
+ax[1].bar(crash_counts_year["year"], crash_counts_year["severe_crashes"])
+ax[1].set_title("Severe Crashes")
+ax[1].set_xlabel("Year"); ax[1].set_ylabel("Severe Crashes")
+
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation:** Severe crashes drop in 2015 even though total crashes don’t 
+suggesting the speed-limit change mainly reduced injury risk.
+
+---
+
+## NYC: Monthly Crash Trends (Seasonality + Policy)
+
+```{python}
+#| fig-cap: "Monthly crash trends for 2013 vs 2015, with the November 2014 speed-limit change marked."
+#| fig-align: center
+#| out-width: 80%
+# Build monthly dataset
+for df in [nyc2013, nyc2015]:
+    df["year_month"] = df["crash_datetime"].dt.to_period("M").astype(str)
+
+monthly_nyc = (
+    pd.concat([nyc2013, nyc2015], ignore_index=True)
+    .groupby("year_month")
+    .agg(
+        total_crashes=("collision_id", "count"),
+        severe_crashes=("severe", "sum")
+    )
+    .reset_index()
+)
+
+monthly_nyc["year_month"] = pd.to_datetime(monthly_nyc["year_month"])
+
+# Separate years so lines do NOT connect
+nyc2013_monthly = monthly_nyc[monthly_nyc["year_month"].dt.year == 2013]
+nyc2015_monthly = monthly_nyc[monthly_nyc["year_month"].dt.year == 2015]
+
+plt.figure(figsize=(10, 4))
+
+plt.plot(
+    nyc2013_monthly["year_month"],
+    nyc2013_monthly["total_crashes"],
+    marker="o",
+    linewidth=2,
+    color="steelblue",
+    label="2013"
+)
+
+plt.plot(
+    nyc2015_monthly["year_month"],
+    nyc2015_monthly["total_crashes"],
+    marker="o",
+    linewidth=2,
+    color="firebrick",
+    label="2015"
+)
+
+# Speed limit policy line (Nov 2014)
+plt.axvline(
+    pd.to_datetime("2014-11-01"),
+    color="black",
+    linestyle="--",
+    linewidth=1.2,
+    label="Speed Limit Change (Nov 2014)"
+)
+
+plt.title("NYC Monthly Total Crashes (2013 vs 2015)")
+plt.xlabel("Month")
+plt.ylabel("Total Crashes")
+plt.xticks(rotation=45, ha="right")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation:** 2015 mirrors 2013’s seasonality but trends slightly lower
+overall, consistent with a small citywide reduction after the speed-limit 
+change.
+
+---
+
+## NYC: Animated Spatial Change (2013 vs 2015)
+
+![](../figures/nyc_13_vs_15.gif){fig-align="center" width="85%"}
+
+**Interpretation:** Spatial patterns look similar across years; crashes continue
+to cluster on major arterials and high-traffic corridors. Any citywide change
+appears to affect the overall level of crashes more than the geographic 
+pattern.
+
+---
+
+## NYC: Borough Patterns
+
+```{python}
+#| fig-cap: "NYC crash totals by borough in 2013 and 2015."
+#| fig-align: center
+#| out-width: 80%
+pivot_total = borough_year_counts.pivot(
+    index="borough",
+    columns="year",
+    values="total_crashes"
+)
+pivot_total.plot(kind="bar", figsize=(9, 3.5))
+plt.title("NYC Total Crashes by Borough")
+plt.xlabel("Borough"); plt.ylabel("Crashes")
+plt.xticks(rotation=35, ha="right")
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation:** Crash totals don’t move uniformly, four boroughs rise
+slightly while Staten Island declines. This shows that citywide trends vary
+and supports the need for more structured comparisons like 
+Difference-in-Differences.
+
+---
+
+## Staten Island Context
+
+Staten Island differs from the rest of NYC:
+
+- More suburban network + higher vehicle dependence
+- Traffic volumes are heavily concentrated along several key arterial corridors
+- Crashes concentrate along specific corridors
+
+That makes corridor projects like SIP especially meaningful here.
+
+---
+
+## SI: Total vs Severe Crashes by Year
+
+```{python}
+#| fig-cap: "Staten Island total and severe crashes before (2014) and after (2016) the SIP project."
+#| fig-align: center
+#| out-width: 85%
+fig, ax = plt.subplots(1, 2, figsize=(9, 3.5))
+ax[0].bar(si_counts_year["year"], si_counts_year["total_crashes"])
+ax[0].set_title("Total Crashes")
+ax[0].set_xlabel("Year"); ax[0].set_ylabel("Crashes")
+
+ax[1].bar(si_counts_year["year"], si_counts_year["severe_crashes"])
+ax[1].set_title("Severe Crashes")
+ax[1].set_xlabel("Year"); ax[1].set_ylabel("Severe Crashes")
+
+plt.tight_layout()
+plt.show()
+```
+
+**Interpretation:** Total crashes stay about the same from 2014 to 2016, while
+severe crashes show a modest decline which is consistent with SIP design
+changes focusing more on injury risk than on reducing all crashes.
+
+---
+
+## SI: Clove Road vs Other SI Roads
+
+![](../figures/si_clove_monthly.png){width="80%"}
+
+**Interpretation:** Clove Road shows a modest decline from 2014 to 2016, while
+other SI roads stay roughly stable; suggesting the SIP redesign may have
+contributed to a localized improvement.
+
+---
+
+## SI: Crash Map with Clove Road Highlighted
+
+![](../figures/si_clove_map.png){width="80%"}
+
+**Interpretation:** Crashes in Staten Island cluster along major arterial
+corridors. Clove Road is one of the key corridors with a noticeable
+concentration of crashes, which helps justify examining it as a SIP
+intervention site.
+
+---
+
+## Modeling Strategy
+
+- Crash counts are overdispersed → Negative Binomial (NB) handles variance > 
+mean better than Poisson.  
+- For Staten Island, DiD compares Clove Road to a control group (other SI roads) 
+to isolate the SIP redesign effect.
+- Month fixed effects account for strong seasonal patterns in crash data.
+
+---
+
+## NYC Model Results (IRRs)
+
+```{python}
+#| tbl-cap: "Incidence Rate Ratios showing citywide policy effects on total and severe crashes."
+#| tbl-align: center
+nyc_results = pd.DataFrame({
+    "Term": ["Post-policy (total)", "Post-policy (severe)"],
+    "IRR": [irr(poisson_nyc.params, "post"),
+            irr(poisson_nyc_sev.params, "post")]
+})
+nyc_results
+```
+
+
+**Interpretation:** The total-crash IRR is close to 1, suggesting the policy 
+did not dramatically change overall crash counts. But the severe-crash IRR is 
+well below 1, indicating risk of injury fell after the speed-limit change. This 
+supports a key Vision Zero principle: speed management primarily reduces crash 
+severity, not necessarily crash frequency.
+
+---
+
+## Staten Island DiD Results (IRRs)
+
+```{python}
+#| tbl-cap: "DiD IRRs comparing Clove Road crash changes to other SI roads after SIP."
+#| tbl-align: center
+si_results = pd.DataFrame({
+    "Term": ["Post × Clove (total)", "Post × Clove (severe)"],
+    "IRR": [irr(poisson_si.params, "post:on_clove"),
+            irr(poisson_si_sev.params, "post:on_clove")]
+})
+si_results
+```
+
+
+**Interpretation:** The interaction effects are substantially below 1. This 
+means that after SIP, crashes on Clove Road decreased 24–27% more than on 
+other Staten Island roads, even after adjusting for seasonal patterns. The 
+sharpening effect for severe crashes reinforces that corridor redesigns can 
+deliver stronger, more localized safety gains than citywide policies alone.
+
+---
+
+## What These Two Policies Show Together
+
+- The speed-limit reduction produced widespread but moderate safety gains, 
+especially by reducing crash severity.
+- The Clove Road SIP generated a sharper decline concentrated exactly where the 
+engineering changes occurred.
+- Together, they demonstrate that Vision Zero works best when broad citywide 
+policies are paired with targeted corridor redesigns, addressing both 
+system-level speed management and local high-injury hotspots.
+
+---
+
+## Limitations
+
+- Only two pre/post years → limits long‑term trend claims.  
+- No direct traffic volume exposure → counts not rates.  
+- Reporting / geocoding quality may vary across years.  
+- Severe definition captures immediate harm, not long-term outcomes.
+
+---
+
+## Recommendations
+
+- Keep expanding SIP‑style redesigns on high‑injury corridors.  
+- Prioritize geometric speed management (lane narrowing, curb extensions).
+- Improve pedestrian visibility at SI arterial hot spots.  
+- Continue publishing crash data for ongoing evaluation.
+
+---
+
+## Sources
+
+- NYC Open Data. *Motor Vehicle Collisions – Crashes*.  
+- NYC DOT. *Vision Zero/Speed Limit Reduction Policy Documents*.  
+- NYC DOT. *Staten Island Clove Road Safety Improvement Project (SIP) materials*.
+- FHWA / TRB safety evaluation guidance on Poisson, NB, and DiD crash modeling.
+
+---
+
+# Thank You!
+
+Questions welcome.
